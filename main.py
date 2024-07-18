@@ -20,10 +20,6 @@ drive.mount('/content/drive')
 # @title git cloneを利用してローカル環境にリポジトリをcloneする．
 !git clone https://github.com/Tom376/dl_lecture_competition_pub.git
 
-# @title ユーザ名とメールアドレスを設定
-!git config --global user.email "number-tangier0u@icloud.com"
-!git config --global user.name "Tom376"
-
 !git config --global init.defualtBranch VQA-competition
 
 # Commented out IPython magic to ensure Python compatibility.
@@ -107,445 +103,6 @@ else:
     print("All files copied successfully.")
 
 print(f"copy time: {time.time() - start:.2f} s")
-
-"""## メインコード
-
-fine tuningの時は，すでにいい重みになっているので，学習率は小さい方がいいけど，後ろの全結合層は初めからなので，トレードオフがある？そう考えると転移学習の方がいいかも
-
-質問文と答えを分散表現する．ソフトマックスを外して，埋め込みベクトルを出力し，それと正解の最小二乗ごさを小さくしようかな．（類似検索とか言うらしい）
-
-zca whiteningはメモリが足りないので無理
-
-不鮮明にする，歪ませるなどのデータ拡張はありかな
-
-損失関数をKL divergenceにする．
-
-1.   base code
-
-【1/1】
-train time: 651.79s
-train loss: 6.0979
-train acc: 0.4714
-train simple acc: 0.3806
-
-9.  sentence embedding and pretrained ResNet (fine tuning) and question processing and huggingface and GCA (early stopした)
-
-testで38ぐらい
-
-10.  sentence embedding and pretrained ResNet (fine tuning) and question processing and huggingface and early stop and KLdiv
-"""
-
-# @title module import
-
-!pip install matplotlib
-import matplotlib.pyplot as plt
-import re
-import random
-import time
-from statistics import mode
-from sklearn.utils import shuffle
-from sklearn.model_selection import train_test_split
-
-from PIL import Image
-import numpy as np
-import pandas
-import torch
-import torch.nn as nn
-import torchvision
-from torchvision import transforms
-from torchvision import models
-import os
-import shutil
-from concurrent.futures import ThreadPoolExecutor
-import csv
-import torch.nn.functional as F
-
-# @title Sentence Embedding
-
-!pip install sentence_transformers
-from sentence_transformers import SentenceTransformer
-
-# @title Sentence Embedding Model の使用例
-
-model = SentenceTransformer('all-MiniLM-L6-v2') # 文を384次元に埋め込み
-sentence_1 = "I love deep learning."
-sentence_2 = "I hate deep learning."
-sentence_3 = "What's your hobby?"
-sentence_4 = "I like deep learning."
-sentence_1 = model.encode(sentence_1)
-sentence_2 = model.encode(sentence_2)
-sentence_3 = model.encode(sentence_3)
-sentence_4 = model.encode(sentence_4)
-
-print(np.dot(sentence_1,sentence_2))
-print(np.dot(sentence_1,sentence_3))
-print(np.dot(sentence_1,sentence_4))
-
-# @title シード値のセット
-
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-set_seed(42)
-
-# @title 言語の前処理
-
-def process_text(text):
-    # lowercase
-    text = text.lower()
-
-    # 数詞を数字に変換
-    num_word_to_digit = {
-        'zero': '0', 'one': '1', 'two': '2', 'three': '3', 'four': '4',
-        'five': '5', 'six': '6', 'seven': '7', 'eight': '8', 'nine': '9',
-        'ten': '10'
-    }
-    for word, digit in num_word_to_digit.items():
-        text = text.replace(word, digit)
-
-    # 小数点のピリオドを削除
-    text = re.sub(r'(?<!\d)\.(?!\d)', '', text)
-
-    # 冠詞の削除
-    text = re.sub(r'\b(a|an|the)\b', '', text)
-
-    # 短縮形のカンマの追加
-    contractions = {
-        "dont": "don't", "isnt": "isn't", "arent": "aren't", "wont": "won't",
-        "cant": "can't", "wouldnt": "wouldn't", "couldnt": "couldn't"
-    }
-    for contraction, correct in contractions.items():
-        text = text.replace(contraction, correct)
-
-    # 句読点をスペースに変換
-    text = re.sub(r"[^\w\s':]", ' ', text)
-
-    # 句読点をスペースに変換
-    text = re.sub(r'\s+,', ',', text)
-
-    # 連続するスペースを1つに変換
-    text = re.sub(r'\s+', ' ', text).strip()
-
-    return text
-
-# @title データローダーの作成
-
-# 1. データローダーの作成
-class VQADataset(torch.utils.data.Dataset):
-    def __init__(self, df_path, image_dir, transform=None, answer=True):
-        self.transform = transform  # 画像の前処理
-        self.image_dir = image_dir  # 画像ファイルのディレクトリ
-        self.df = pandas.read_json(df_path)  # 画像ファイルのパス，question, answerを持つDataFrame
-        self.answer = answer
-        self.sentence_embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-
-        # answerの辞書を作成
-        self.answer2idx = {}
-        self.idx2answer = {}
-
-        if self.answer:
-            # 回答に含まれる単語を辞書に追加
-            for answers in self.df["answers"]:
-                for answer in answers:
-                    word = answer["answer"]
-                    word = process_text(word)
-                    if word not in self.answer2idx:
-                        self.answer2idx[word] = len(self.answer2idx)
-            self.idx2answer = {v: k for k, v in self.answer2idx.items()}  # 逆変換用の辞書(answer)
-
-
-    def update_dict(self, dataset):
-        """
-        検証用データ，テストデータの辞書を訓練データの辞書に更新する．
-
-        Parameters
-        ----------
-        dataset : Dataset
-            訓練データのDataset
-        """
-
-        # 単語を辞書に追加
-        with open("/content/data/data_annotations_class_mapping.csv", "r") as csvfile: # CSVファイルを開く
-            new_dict = csv.DictReader(csvfile) # CSVファイルを辞書型で読み込む
-            new_dict = {row['answer']: i for i, row in enumerate(new_dict)} # Convert DictReader to dictionary
-
-        self.answer2idx = {**new_dict, **dataset.answer2idx} # 引数に指定する複数の辞書のキーが重複している場合．後ろ（右側）の辞書の値で上書き
-        self.idx2answer = {**{v: k for k, v in new_dict.items()}, **dataset.idx2answer}
-
-    def __getitem__(self, idx):
-        """
-        対応するidxのデータ（画像，質問，回答）を取得．
-
-        Parameters
-        ----------
-        idx : int
-            取得するデータのインデックス
-
-        Returns
-        -------
-        image : torch.Tensor  (C, H, W)
-            画像データ
-        question : torch.Tensor  (vocab_size)
-            質問文を分散表現に変換したもの
-        answers : torch.Tensor  (n_answer)
-            10人の回答者の回答のid
-        mode_answer_idx : torch.Tensor  (1)
-            10人の回答者の回答の中で最頻値の回答のid
-        """
-        # 画像
-        image = Image.open(f"{self.image_dir}/{self.df['image'][idx]}")
-        image = self.transform(image)
-
-
-        # 質問にprocess_textをして，さらに分散表現にする
-        question = self.sentence_embedding_model.encode(process_text(self.df["question"][idx])) # 384次元
-
-        if self.answer:
-            answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
-            mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
-
-            return image, torch.Tensor(question), torch.Tensor(answers), int(mode_answer_idx)
-
-        else:
-            return image, torch.Tensor(question)
-
-
-    def __len__(self):
-        return len(self.df)
-
-# @title 評価指標の実装
-
-# 2. 評価指標の実装
-# 簡単にするならBCEを利用する
-def VQA_criterion(batch_pred: torch.Tensor, batch_answers: torch.Tensor):
-    total_acc = 0.
-
-    for pred, answers in zip(batch_pred, batch_answers):
-        acc = 0.
-        for i in range(len(answers)):
-            num_match = 0
-            for j in range(len(answers)):
-                if i == j:
-                    continue
-                if pred == answers[j]:
-                    num_match += 1
-            acc += min(num_match / 3, 1)
-        total_acc += acc / 10
-
-    return total_acc / len(batch_pred)
-
-# @title モデルの実装
-
-from torchvision.models import resnet18, ResNet18_Weights
-
-class VQAModel(nn.Module):
-    def __init__(self, vocab_size: int, n_answer: int):
-        super().__init__()
-        self.resnet = models.resnet18(weights=ResNet18_Weights.DEFAULT)
-        #for p in self.resnet.parameters():
-        #    p.requires_grad = True # 転移学習の時はFalse
-        fc_input_dim = self.resnet.fc.in_features
-        self.resnet.fc = nn.Linear(fc_input_dim, 512)
-
-        self.text_encoder = nn.Linear(vocab_size, 512)
-
-        self.fc = nn.Sequential(
-            nn.Linear(1024, 512),
-            nn.ReLU(inplace=True),
-            nn.Linear(512, n_answer)
-        )
-
-    def forward(self, image, question):
-        image_feature = self.resnet(image)  # 画像の特徴量
-        question_feature = self.text_encoder(question)  # テキストの特徴量
-
-        x = torch.cat([image_feature, question_feature], dim=1)
-        x = self.fc(x)
-
-        return x
-
-# @title 学習の実装
-
-# 4. 学習の実装
-def train(model, dataloader, optimizer, criterion, device):
-    model.train()
-
-    total_loss = 0
-    total_acc = 0
-    simple_acc = 0
-
-    start = time.time()
-    for image, question, answers, mode_answer in dataloader:
-        image, question, answer, mode_answer = \
-            image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
-
-        pred = model(image, question)
-
-        # KLダイバージェンスの計算に必要な処理
-        pred_probs = F.softmax(pred, dim=1)  # Apply softmax along the class dimension
-        mode_answer_onehot = F.one_hot(mode_answer.squeeze(), num_classes=pred_probs.shape[1]).float()
-
-        # KLダイバージェンスの計算
-        loss = criterion(pred_probs.log(), mode_answer_onehot)
-
-        # loss = criterion(pred, mode_answer.squeeze())
-
-        optimizer.zero_grad()
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        total_loss += loss.item()
-        total_acc += VQA_criterion(pred.argmax(1), answers)  # VQA accuracy
-        simple_acc += (pred.argmax(1) == mode_answer).float().mean().item()  # simple accuracy
-
-    return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
-
-
-def eval(model, dataloader, optimizer, criterion, device):
-    model.eval()
-
-    total_loss = 0
-    total_acc = 0
-    simple_acc = 0
-
-    start = time.time()
-    for image, question, answers, mode_answer in dataloader:
-        image, question, answer, mode_answer = \
-            image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
-
-        pred = model(image, question)
-
-        # KLダイバージェンスの計算に必要な処理
-        pred_probs = F.softmax(pred, dim=1)  # Apply softmax along the class dimension
-        mode_answer_onehot = F.one_hot(mode_answer.squeeze(), num_classes=pred_probs.shape[1]).float()
-
-        # KLダイバージェンスの計算
-        loss = criterion(pred_probs.log(), mode_answer_onehot)
-
-        # loss = criterion(pred, mode_answer.squeeze())
-
-        #loss = criterion(pred, mode_answer.squeeze())
-
-        total_loss += loss.item()
-        total_acc += VQA_criterion(pred.argmax(1), answers)  # VQA accuracy
-        simple_acc += (pred.argmax(1) == mode_answer).float().mean().item()  # simple accuracy
-
-    return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
-
-# @title deviceの設定
-
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print('device = ', device)
-
-# @title Dataloader / Model
-
-# データ拡張
-train_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor()
-])
-
-test_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor()
-])
-
-trainval_dataset = VQADataset(df_path="/content/data/train.json", image_dir="/content/data/train", transform=train_transform)
-test_dataset = VQADataset(df_path="/content/data/valid.json", image_dir="/content/data/valid", transform=test_transform, answer=False)
-test_dataset.update_dict(trainval_dataset)
-
-# trainとvalidに分割
-train_dataset, val_dataset = torch.utils.data.random_split(trainval_dataset, [len(trainval_dataset)-3000, 3000])
-
-train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
-val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=1, shuffle=False)
-test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
-
-model = VQAModel(vocab_size=384, n_answer=len(trainval_dataset.answer2idx)).to(device)
-
-# @title optimizer / criterion
-# optimizer / criterion
-num_epoch = 10
-# criterion = nn.CrossEntropyLoss()
-criterion = nn.KLDivLoss() # 損失関数をKLダイバージェンスにする
-optimizer = torch.optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-5)
-
-# @title Train model
-
-train_losses = []
-train_accs = []
-train_simple_accs = []
-val_losses = []
-val_accs = []
-val_simple_accs = []
-max_val_acc = 0 # accの最大値
-no_update_count = 0 # 最大値が更新されなかった回数をカウント
-max_no_update = 2 # 更新されなかった最大回数
-
-for epoch in range(num_epoch):
-    train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device)
-    train_losses.append(train_loss)
-    train_accs.append(train_acc)
-    train_simple_accs.append(train_simple_acc)
-
-    val_loss, val_acc, val_simple_acc, val_time = eval(model, train_loader, optimizer, criterion, device)
-    val_losses.append(val_loss)
-    val_accs.append(val_acc)
-    val_simple_accs.append(val_simple_acc)
-    print(f"【{epoch + 1}/{num_epoch}】\n"
-          f"val time: {val_time:.2f} s\n"
-          f"val loss: {val_loss:.4f}\n"
-          f"val acc: {val_acc:.4f}\n"
-          f"val simple acc: {val_simple_acc:.4f}")
-    if val_acc > max_val_acc:
-        max_val_acc = val_acc
-        no_update_count = 0  # 更新されたのでリセット
-    else:
-        no_update_count += 1
-    if no_update_count >= max_no_update:
-        print("early stop")
-        break
-
-# @title 提出用ファイルの作成
-
-model.eval()
-submission = []
-for image, question in test_loader:
-    image, question = image.to(device), question.to(device)
-    pred = model(image, question)
-    pred = pred.argmax(1).cpu().item()
-    submission.append(pred)
-
-submission = [trainval_dataset.idx2answer[id] for id in submission]
-submission = np.array(submission)
-np.save("submission.npy", submission)
-
-# @title modelの保存
-torch.save(model.state_dict(), "model_0716.pth")
-
-# @title 学習の可視化
-
-fig, ax = plt.subplots()
-t = np.linspace(1,epoch,epoch+1)
-ax.set_xlabel('Epoch')
-ax.grid()
-print(t)
-#ax.plot(t,train_losses,color = 'red',label='train loss')
-ax.plot(t,train_accs,label='train acc')
-ax.plot(t,train_simple_accs,label='train simple acc')
-ax.plot(t,val_accs,label='val acc')
-ax.plot(t,val_simple_accs,label='val simple acc')
-ax.legend(loc = 0)
-fig.tight_layout()
-plt.show()
 
 """## Base Code"""
 
@@ -978,9 +535,11 @@ for image, question in test_loader:
     submission.append(pred)
 
 submission = [train_dataset.idx2answer[id] for id in submission]
-submission = np.array(submission)
-torch.save(model.state_dict(), "model.pth")
-np.save("submission.npy", submission)
+#submission = np.array(submission)
+#torch.save(model.state_dict(), "model.pth")
+#np.save("submission.npy", submission)
+
+print(submission)
 
 """## Vilt"""
 
@@ -1067,113 +626,25 @@ class VQADataset(torch.utils.data.Dataset):
         image = self.transform(image)
         question = self.df["question"][idx]
         processed = self.processor(image, question, padding="max_length", truncation=True, return_tensors="pt")
-        # processed <class 'transformers.tokenization_utils_base.BatchEncoding'>
 
         if self.answer:
             answers = [process_text(answer["answer"]) for answer in self.df["answers"][idx]]
+            answers_idx = []
+            for word in answers:
+                try:
+                  id = model.config.label2id[word]
+                  answers_idx.append(id)
+                except:
+                  id = model.config.label2id['unknown']
+                  answers_idx.append(id)
+            mode_answer_idx = mode(answers_idx)  # 最頻値を取得（正解ラベル）
 
-            return processed, answers
+            return processed, answers_idx, int(mode_answer_idx)
         else:
             return processed
 
     def __len__(self):
         return len(self.df)
-
-'''
-class VQADataset(torch.utils.data.Dataset):
-    def __init__(self, df_path, image_dir, transform=None, processor=None, answer=True):
-        self.transform = transform  # 画像の前処理
-        self.image_dir = image_dir  # 画像ファイルのディレクトリ
-        self.df = pandas.read_json(df_path)  # 画像ファイルのパス，question, answerを持つDataFrame
-        self.processor = processor
-        self.answer = answer
-
-        # question / answerの辞書を作成
-        self.question2idx = {}
-        self.answer2idx = {}
-        self.idx2question = {}
-        self.idx2answer = {}
-
-        # 質問文に含まれる単語を辞書に追加
-        for question in self.df["question"]:
-            question = process_text(question)
-            words = question.split(" ")
-            for word in words:
-                if word not in self.question2idx:
-                    self.question2idx[word] = len(self.question2idx)
-        self.idx2question = {v: k for k, v in self.question2idx.items()}  # 逆変換用の辞書(question)
-
-        if self.answer:
-            # 回答に含まれる単語を辞書に追加
-            for answers in self.df["answers"]:
-                for answer in answers:
-                    word = answer["answer"]
-                    word = process_text(word)
-                    if word not in self.answer2idx:
-                        self.answer2idx[word] = len(self.answer2idx)
-            self.idx2answer = {v: k for k, v in self.answer2idx.items()}  # 逆変換用の辞書(answer)
-
-    def update_dict(self, dataset):
-        """
-        検証用データ，テストデータの辞書を訓練データの辞書に更新する．
-
-        Parameters
-        ----------
-        dataset : Dataset
-            訓練データのDataset
-        """
-        self.question2idx = dataset.question2idx
-        self.answer2idx = dataset.answer2idx
-        self.idx2question = dataset.idx2question
-        self.idx2answer = dataset.idx2answer
-
-    def __getitem__(self, idx):
-        """
-        対応するidxのデータ（画像，質問，回答）を取得．
-
-        Parameters
-        ----------
-        idx : int
-            取得するデータのインデックス
-
-        Returns
-        -------
-        image : torch.Tensor  (C, H, W)
-            画像データ
-        question : torch.Tensor  (vocab_size)
-            質問文をone-hot表現に変換したもの
-        answers : torch.Tensor  (n_answer)
-            10人の回答者の回答のid
-        mode_answer_idx : torch.Tensor  (1)
-            10人の回答者の回答の中で最頻値の回答のid
-        """
-        image = Image.open(f"{self.image_dir}/{self.df['image'][idx]}")
-        #image = f"{self.image_dir}/{self.df['image'][idx]}"
-        if self.transform:
-            #image = torchvision.transforms.functional.to_tensor(image)
-            image = self.transform(image)
-            image = image
-            #image = ToPILToTensor(image)
-
-        #question = process_text(self.df["question"][idx])
-        question = self.df["question"][idx]
-
-        processed = self.processor(image, question, padding="max_length", truncation=True, return_tensors="pt")
-
-        if self.answer:
-            #answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
-            answers = [process_text(answer["answer"]) for answer in self.df["answers"][idx]] # wordのまま
-            #answers : ['zipper on jacket', 'zipper', 'zipper', 'jacket', 'zipper', 'unanswerable', 'jacket', 'zipper', 'jacket zipper', 'zipper']
-            #mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
-            mode_answer_idx = 0 # 使わないので適当
-
-            return processed, question, answers, int(mode_answer_idx)
-        else:
-            return processed, question
-
-    def __len__(self):
-        return len(self.df)
-'''
 
 # @title 評価指標の実装
 
@@ -1206,23 +677,22 @@ def train(processor, model, dataloader, optimizer, criterion, device):
 
     start = time.time()
 
-    for processed, answers in dataloader:
+    for processed, answers, mode_answer in dataloader:
 
         outputs = model(**processed).logits
+        outputs = F.log_softmax(outputs, dim=-1) # softmaxで規格化
         outputs.to(device)
 
         answers_onehot = torch.zeros(3129).to(device)
-        for word in answers:
-            try:
-                id = model.config.label2id[word]
-                answers_onehot[id] += 1
-            except:
-                id = model.config.label2id['unknown']
-                answers_onehot[id] += 1
+        for id in answers:
+            answers_onehot[id] += 1
         answers_onehot = answers_onehot / len(answers) # 規格化
         answers_onehot = answers_onehot.to(device)
 
-        loss = criterion(outputs, answers_onehot).to(device)
+        mode_answer = torch.tensor(mode_answer)
+        mode_answer = F.one_hot(mode_answer, num_classes=3129).float().to(device)
+
+        loss = criterion(outputs, mode_answer).to(device)
 
         optimizer.zero_grad()
         loss.backward()
@@ -1233,88 +703,6 @@ def train(processor, model, dataloader, optimizer, criterion, device):
         #mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
 
     return total_loss / len(dataloader), total_acc / len(dataloader), 0, time.time() - start
-
-'''
-def train(processor, model, dataloader, optimizer, criterion, device):
-    model.train()
-
-    total_loss = 0
-    total_acc = 0
-    simple_acc = 0
-
-    start = time.time()
-
-    i = 0
-
-    for processed, question, answers, mode_answer in dataloader:
-
-        #inputs = processor(image, question, padding="max_length", truncation=True, return_tensors="pt").to(device)
-        #outputs = model(**inputs).logits.to(device) # 回答の選択肢の数
-        #outputs = F.log_softmax(outputs, dim=-1) # softmaxで規格化
-        #print(outputs.shape)
-        #image = ToPILImage(image)
-        #print('image.shape :',image.shape)
-        #for img in image:  # imageはバッチなので、各画像をループ
-        #    img = torchvision.transforms.functional.to_pil_image(img)
-        #print('image.shape :',image.shape)
-
-        print('processed :', type(processed))
-        print('question :', type(question))
-        print('answers :', type(answers))
-        print('mode_answer :', type(mode_answer))
-
-
-
-
-        #image = Image.open(image[0])
-
-        print('ffff')
-        outputs = model(**processed).logits
-        outputs.to(device)
-        print('notfff')
-
-        #outputs = model(image, question).to(device)
-
-
-        #mode_answer = mode_answer.to(device)
-        #mode_answer = nn.functional.one_hot(mode_answer, num_classes=3129).float()
-        # mode_answerではなくanswersの情報を使った方がいいのでは？
-        #answers_onehot = torch.zeros(3129).to(device)
-        #for i in range(len(answers)):
-        #    answers_onehot += nn.functional.one_hot(answers[i], num_classes=3129).float().to(device)
-        #answers_onehot = answers_onehot / len(answers) # 規格化
-        #answers_onehot = torch.stack([nn.functional.one_hot(ans, num_classes=3129).float() for ans in answers]).mean(dim=0).to(device)
-        #answers_onehot = torch.stack([nn.functional.one_hot(answer, num_classes=n_answer).float() for answer in answers]).mean(dim=0).to(device)
-        #answers_onehot = F.softmax(answers_onehot,dim=-1).to(device)
-        #print('ans.shape :',answers_onehot.shape)
-        #print('ans_sum:', torch.sum(answers_onehot, dim=-1))
-        #answers_onehot = F.one_hot(mode_answer, num_classes=n_answer).float().to(device)
-
-        #loss = criterion(outputs, mode_answer.squeeze())
-        answers_onehot = torch.zeros(3129).to(device)
-        for word in answers:
-            try:
-                id = model.config.label2id[word]
-                answers_onehot[id] += 1
-            except:
-                id = model.config.label2id['unknown']
-                answers_onehot[id] += 1
-        answers_onehot = answers_onehot / len(answers) # 規格化
-        answers_onehot = answers_onehot.to(device)
-
-        loss = criterion(outputs, answers_onehot).to(device)
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        total_loss += loss.item()
-        total_acc += VQA_criterion(outputs.argmax(1), answers)  # VQA accuracy
-        #simple_acc += (outputs.argmax(1) == mode_answer).float().mean().item()  # simple accuracy
-
-    #return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
-    return total_loss / len(dataloader), total_acc / len(dataloader), 0, time.time() - start
-'''
 
 # @title 評価の実装
 
@@ -1345,49 +733,6 @@ set_seed(42)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print('device:', device)
 
-# @title collate_fn_1
-'''
-from transformers import BatchEncoding
-from torch.nn.utils.rnn import pad_sequence
-
-def collate_fn_train(batch):
-    pixel_values = [item[0]['pixel_values'].squeeze(0) for item in batch]
-    input_ids = [item[0]['input_ids'].squeeze(0) for item in batch]
-    attention_mask = [item[0]['attention_mask'].squeeze(0) for item in batch]
-    answers = [item[1] for item in batch]
-
-    # パディング
-    pixel_values = torch.stack(pixel_values)
-    input_ids = pad_sequence(input_ids, batch_first=True, padding_value=0)
-    attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
-
-    batch_encoding = BatchEncoding({
-        'pixel_values': pixel_values,
-        'input_ids': input_ids,
-        'attention_mask': attention_mask
-    })
-
-    return batch_encoding, answers
-
-def collate_fn_valid(batch):
-    pixel_values = [item['pixel_values'].squeeze(0) for item in batch]
-    input_ids = [item['input_ids'].squeeze(0) for item in batch]
-    attention_mask = [item['attention_mask'].squeeze(0) for item in batch]
-
-    # パディング
-    pixel_values = torch.stack(pixel_values)
-    input_ids = pad_sequence(input_ids, batch_first=True, padding_value=0)
-    attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
-
-    batch_encoding = BatchEncoding({
-        'pixel_values': pixel_values,
-        'input_ids': input_ids,
-        'attention_mask': attention_mask
-    })
-
-    return batch_encoding
-'''
-
 # @title collate_fn
 
 from transformers import BatchEncoding
@@ -1404,11 +749,13 @@ def collate_fn_train(batch):
     images = torch.stack(images)
 
     answers = [item[1] for item in batch]
+    mode_answer = [item[2] for item in batch]
+
     return {
         'pixel_values': images,
         'input_ids': input_ids,
         'attention_mask': attention_mask
-    }, answers
+    }, answers, mode_answer
 
 def collate_fn_valid(batch):
     images = [item["pixel_values"].squeeze(0).to(device) for item in batch]
@@ -1437,56 +784,14 @@ model = ViltForQuestionAnswering.from_pretrained("dandelin/vilt-b32-finetuned-vq
 model.to(device)
 
 train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform, processor=processor)
-#test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, processor=processor, answer=False)
 test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, processor=processor, answer=False)
-#test_dataset.update_dict(train_dataset)
 
-#train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-#test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
 train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, collate_fn=collate_fn_train)
 test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, collate_fn=collate_fn_valid)
 
-
-'''
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    #transforms.ToTensor()
-])
-
-processor = ViltProcessor.from_pretrained("dandelin/vilt-b32-finetuned-vqa")
-model = ViltForQuestionAnswering.from_pretrained("dandelin/vilt-b32-finetuned-vqa")
-model.to(device)
-
-train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform, processor=processor)
-test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, processor=processor, answer=False)
-#test_dataset.update_dict(train_dataset)
-
-
-
-# データセットの一部を取得
-#train_dataset = torch.utils.data.Subset(train_dataset, range(100))
-#test_dataset = torch.utils.data.Subset(test_dataset, range(10))
-
-from torch.utils.data import DataLoader
-import torch
-
-def custom_collate_fn(batch):
-    images, questions, answers, mode_answers = zip(*batch)
-    return list(images), list(questions), list(answers), torch.tensor(mode_answers)
-#train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, collate_fn=custom_collate_fn)
-#test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, collate_fn=custom_collate_fn)
-
-
-train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
-
-
-#model = VQAModel(processor=processor, viltqa = viltqa, n_answer=n_answer).to(device)
-'''
-
 # @title optimizer / criterion
 
-num_epoch = 10
+num_epoch = 5
 criterion = nn.KLDivLoss(reduction='batchmean')
 optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
 #criterion = nn.CrossEntropyLoss()
@@ -1511,7 +816,7 @@ for epoch in range(num_epoch):
     submission = [model.config.id2label[id] for id in submission]
     for i in range(len(submission)):
         if submission[i] == 'unknown':
-            submission[i] = 'unanswerble'
+            submission[i] = 'unanswerable'
     submission = np.array(submission)
 
     np.save("submission_%d.npy" %epoch, submission)
@@ -1522,7 +827,7 @@ torch.save(model.state_dict(), "model.pth")
 
 # @title モデルの読み込み
 
-model.load_state_dict(torch.load('/content/drive/MyDrive/Colab Notebooks/DLBasics2023_colab/vqa/dl_lecture_competition_pub/model_vilt.pth'))
+model.load_state_dict(torch.load('/content/drive/MyDrive/Colab Notebooks/DLBasics2023_colab/vqa/dl_lecture_competition_pub/model1.pth'))
 
 # @title example of question, answer and image
 
@@ -1532,7 +837,7 @@ model.eval()
 df_path = "./data/valid.json"
 df = pandas.read_json(df_path)  # 画像ファイルのパス，question, answerを持つDataFrame
 
-id = 227
+id = 2200
 
 # question
 questions = df["question"]
@@ -1560,62 +865,23 @@ import matplotlib.pyplot as plt
 plt.imshow(image)
 plt.show()
 
-print(type(model))
-
 # @title テストデータに対する推測
 
 model.eval()
 submission = []
 for processed in test_loader:
     outputs = model(**processed).logits
-    submission.append(outputs.argmax(-1).item())
+    pred = outputs.argmax(-1).item()
+    submission.append(pred)
 
 submission = [model.config.id2label[id] for id in submission]
 for i in range(len(submission)):
     if submission[i] == 'unknown':
-        submission[i] = 'unanswerble'
+        submission[i] = 'unanswerable'
 submission = np.array(submission)
-
-# @title テストデータに対する推測
-
-model.eval()
-submission = []
-i = 0
-for image, question in test_loader:
-    image = Image.open(image[0])
-    inputs = processor(image, question, padding="max_length", truncation=True, return_tensors="pt").to(device)
-    outputs = model(**inputs).logits.to(device)
-    #outputs[0][outputs.argmax(1).item()] = 0 # unanswerbleは除く
-    submission.append(outputs.argmax(-1).item())
-
-submission = [model.config.id2label[id] for id in submission]
-submission = np.array(submission)
-
-print(submission)
-
-j = 0
-for i in range(len(submission)):
-    if submission[i] == 'unanswerble':
-        j += 1
-print(j)
 
 # @title 提出用ファイルの作成
 
-np.save("submission_unfinedtuned.npy", submission)
-
-# @title 提出用ファイルの作成
-
-model.eval()
-submission = []
-for image, question in test_loader:
-    image, question = image.to(device), question.to(device)
-    pred = model(image, question)
-    pred = pred.argmax(1).cpu().item()
-    submission.append(pred)
-
-submission = [train_dataset.idx2answer[id] for id in submission]
-submission = np.array(submission)
-torch.save(model.state_dict(), "model.pth")
 np.save("submission.npy", submission)
 
 # @title gpuメモリの解放
